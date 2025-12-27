@@ -95,16 +95,159 @@ class ProgressManager:
         except Exception as e:
             logger.warning(f"Error updating progress: {e}")
 
-# ================= بخش وب‌سرور (دانلودر) =================
+# ================= قالب HTML (صفحه دانلود زیبا) =================
+
+def get_download_page_html(file_name, file_size, download_url):
+    return f"""
+    <!DOCTYPE html>
+    <html lang="fa" dir="rtl">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>دانلود فایل | {file_name}</title>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;500;700&display=swap');
+            
+            body {{
+                margin: 0;
+                padding: 0;
+                font-family: 'Vazirmatn', sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                color: #fff;
+            }}
+            .card {{
+                background: rgba(255, 255, 255, 0.15);
+                backdrop-filter: blur(10px);
+                border-radius: 20px;
+                padding: 40px;
+                width: 90%;
+                max-width: 450px;
+                text-align: center;
+                box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                transition: transform 0.3s ease;
+            }}
+            .card:hover {{
+                transform: translateY(-5px);
+            }}
+            .icon {{
+                font-size: 80px;
+                margin-bottom: 20px;
+                animation: float 3s ease-in-out infinite;
+            }}
+            h1 {{
+                font-size: 20px;
+                margin-bottom: 10px;
+                word-break: break-all;
+                color: #fff;
+                font-weight: 700;
+            }}
+            .info {{
+                background: rgba(0, 0, 0, 0.2);
+                border-radius: 10px;
+                padding: 15px;
+                margin: 20px 0;
+                font-size: 14px;
+                display: flex;
+                justify-content: space-between;
+            }}
+            .btn {{
+                background: #fff;
+                color: #764ba2;
+                border: none;
+                padding: 15px 30px;
+                border-radius: 50px;
+                font-size: 18px;
+                font-weight: bold;
+                cursor: pointer;
+                text-decoration: none;
+                display: block;
+                width: auto;
+                margin-top: 20px;
+                transition: all 0.3s ease;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            }}
+            .btn:hover {{
+                background: #f0f0f0;
+                transform: scale(1.05);
+                box-shadow: 0 8px 20px rgba(0,0,0,0.3);
+            }}
+            @keyframes float {{
+                0% {{ transform: translateY(0px); }}
+                50% {{ transform: translateY(-15px); }}
+                100% {{ transform: translateY(0px); }}
+            }}
+            .footer {{
+                margin-top: 20px;
+                font-size: 12px;
+                opacity: 0.7;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="icon">📂</div>
+            <h1>{file_name}</h1>
+            
+            <div class="info">
+                <span>📦 حجم فایل:</span>
+                <span dir="ltr">{file_size}</span>
+            </div>
+            
+            <a href="{download_url}" class="btn">⬇️ دانلود فایل</a>
+            
+            <div class="footer">
+                قدرت گرفته از Telethon Server
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+# ================= بخش وب‌سرور =================
 
 async def root_handler(request):
     return web.Response(text="Bot is running...", content_type='text/plain')
 
+async def page_handler(request):
+    """نمایش صفحه HTML زیبا برای دانلود"""
+    try:
+        encoded_data = request.match_info.get('code')
+        try:
+            decoded = base64.urlsafe_b64decode(encoded_data).decode()
+            chat_id, message_id = map(int, decoded.split(':'))
+        except:
+            return web.Response(text="لینک نامعتبر است", status=400)
+
+        message = await client.get_messages(chat_id, ids=message_id)
+        if not message or not message.media:
+            return web.Response(text="فایل یافت نشد", status=404)
+
+        file_name = "Unknown File"
+        for attr in message.document.attributes:
+            if isinstance(attr, DocumentAttributeFilename):
+                file_name = attr.file_name
+                break
+        
+        file_size = human_readable_size(message.document.size)
+        
+        # لینک دانلود واقعی (Endpoint استریم)
+        base_url = str(request.url.origin)
+        stream_url = f"{base_url}/stream/{encoded_data}"
+        
+        html_content = get_download_page_html(file_name, file_size, stream_url)
+        return web.Response(text=html_content, content_type='text/html')
+
+    except Exception as e:
+        logger.error(f"Page Error: {e}")
+        return web.Response(text="خطای سرور", status=500)
+
 async def stream_handler(request):
-    """
-    هندلر دانلود فایل از تلگرام (File -> Link)
-    اصلاح شده برای رفع مشکل گیر کردن: حذف Content-Length + بستن اجباری کانکشن
-    """
+    """استریم واقعی فایل (بعد از کلیک روی دکمه)"""
     try:
         encoded_data = request.match_info.get('code')
         try:
@@ -123,40 +266,33 @@ async def stream_handler(request):
                 file_name = attr.file_name
                 break
         
-        # نکته مهم: ما اینجا حجم را به مرورگر نمیدهیم تا منتظر نماند.
-        # مرورگر دانلود را نشان میدهد اما درصد پر نمیشود (چون انتها باز است)
-        # اما در عوض دانلود ۱۰۰٪ موفق انجام میشود و گیر نمیکند.
         encoded_filename = quote(file_name)
-
+        file_size = message.document.size
+        
         headers = {
             'Content-Type': message.document.mime_type or 'application/octet-stream',
             'Content-Disposition': f'attachment; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}',
-            'Connection': 'keep-alive',
+            'Content-Length': str(file_size),
         }
 
         response = web.StreamResponse(status=200, headers=headers)
-        
-        # فعال کردن Chunked Encoding (بسیار مهم برای استریم بدون گیر کردن)
-        response.enable_chunked_encoding()
-        
         await response.prepare(request)
 
         try:
-            # استفاده از چانک سایز ۶۴ کیلوبایت برای پایداری بیشتر
-            async for chunk in client.iter_download(message.media, chunk_size=65536):
+            async for chunk in client.iter_download(message.media, chunk_size=524288): # 512KB chunks
                 await response.write(chunk)
             
-            # پایان موفقیت آمیز
             await response.write_eof()
             
         except Exception as e:
-            logger.error(f"Stream interrupted: {e}")
-            
+            # قطع شدن دانلود توسط کاربر طبیعی است
+            pass
+
         return response
 
     except Exception as e:
-        logger.error(f"Handler Error: {e}")
-        return web.Response(text="Internal Server Error", status=500)
+        logger.error(f"Stream Error: {e}")
+        return web.Response(status=500)
 
 # ================= بخش ربات تلگرام =================
 
@@ -172,6 +308,7 @@ async def start_handler(event):
 
 **قابلیت‌های من:**
 1️⃣ **تبدیل فایل به لینک:** فایل بفرست، لینک دانلود مستقیم بگیر.
+   (صفحه دانلود اختصاصی 🌐)
 2️⃣ **آپلودر لینک:** لینک مستقیم بفرست، فایلش رو توی تلگرام تحویل بگیر.
 
 🚀 **بدون محدودیت حجم (تا ۲ گیگابایت)**
@@ -188,7 +325,7 @@ async def start_handler(event):
 async def help_handler(event):
     await event.answer("فایل بفرست -> لینک بگیر\nلینک بفرست -> فایل بگیر", alert=True)
 
-# ----------------- هندلر لینک به فایل (Leech) - (دست نخورده طبق دستور) -----------------
+# ----------------- هندلر لینک به فایل (Leech) - (دست نخورده) -----------------
 @client.on(events.NewMessage(pattern=r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'))
 async def url_handler(event):
     url = event.text.strip()
@@ -266,7 +403,7 @@ async def url_handler(event):
         if 'local_file' in locals() and os.path.exists(local_file):
             os.remove(local_file)
 
-# ----------------- هندلر فایل به لینک (Stream) -----------------
+# ----------------- هندلر فایل به لینک (نمایش صفحه HTML) -----------------
 @client.on(events.NewMessage)
 async def file_handler(event):
     if not event.media or event.message.message.startswith('/') or event.message.message.startswith('http'):
@@ -293,7 +430,8 @@ async def file_handler(event):
                     file_name = attr.file_name
                     break
         
-        download_link = f"{base_url}/dl/{encoded_id}"
+        # این لینک کاربر را به صفحه HTML می‌برد
+        page_link = f"{base_url}/dl/{encoded_id}"
         
         text = f"""
 ✅ **لینک دانلود مستقیم آماده شد!**
@@ -301,15 +439,15 @@ async def file_handler(event):
 📁 **نام فایل:** `{file_name}`
 💾 **حجم:** `{file_size_str}`
 
-🔗 **لینک شما:**
-`{download_link}`
+🔗 **لینک صفحه دانلود:**
+`{page_link}`
 
-⚠️ _این لینک مستقیم از سرور تلگرام استریم می‌شود._
+⚠️ _روی لینک کلیک کنید تا وارد صفحه دانلود شوید._
         """
         
         buttons = [
-            [Button.url("📥 دانلود فوری", download_link)],
-            [Button.url("اشتراک گذاری 🔗", f"https://t.me/share/url?url={download_link}")]
+            [Button.url("🌐 صفحه دانلود", page_link)],
+            [Button.url("اشتراک گذاری 🔗", f"https://t.me/share/url?url={page_link}")]
         ]
         
         await msg.edit(text, buttons=buttons, link_preview=False)
@@ -324,8 +462,12 @@ async def main():
     logger.info("✅ Bot Started!")
 
     app = web.Application()
+    # هندلر صفحه اصلی
     app.router.add_get('/', root_handler)
-    app.router.add_get('/dl/{code}', stream_handler)
+    # هندلر صفحه HTML (برای نمایش دکمه)
+    app.router.add_get('/dl/{code}', page_handler)
+    # هندلر دانلود واقعی (فایل)
+    app.router.add_get('/stream/{code}', stream_handler)
     
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)

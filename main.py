@@ -28,6 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # آدرس سرور (خودکار)
+# نکته مهم: اگر در لوکال تست میکنید این مقدار لوکال هاست است، اما در رندر آدرس سایت شماست
 RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:8080')
 
 # کلاینت تلگرام
@@ -235,8 +236,9 @@ async def page_handler(request):
         
         file_size = human_readable_size(message.document.size)
         
-        # لینک دانلود واقعی (Endpoint استریم)
-        base_url = str(request.url.origin)
+        # === اصلاح بخش آدرس‌دهی برای رفع ارور 404 ===
+        # استفاده از متغیر سراسری به جای request.url.origin که باعث ارور می‌شد
+        base_url = RENDER_EXTERNAL_URL.rstrip('/')
         stream_url = f"{base_url}/stream/{encoded_data}"
         
         html_content = get_download_page_html(file_name, file_size, stream_url)

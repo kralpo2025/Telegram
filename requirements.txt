@@ -3,3 +3,4 @@ aiohttp
 cryptg
 pyaes
 uvloop
+humanize

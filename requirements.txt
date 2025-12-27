@@ -1,0 +1,5 @@
+telethon
+aiohttp
+cryptg
+pyaes
+uvloop

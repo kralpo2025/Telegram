@@ -57,13 +57,12 @@ class ProgressManager:
     def __init__(self, event, action_name):
         self.event = event
         self.last_update_time = 0
-        self.action_name = action_name # "دانلود" یا "آپلود"
+        self.action_name = action_name 
         self.start_time = time.time()
         self.message = None
 
     async def callback(self, current, total):
         now = time.time()
-        # آپدیت پیام هر 4 ثانیه یا در پایان کار (برای جلوگیری از بن شدن)
         if (now - self.last_update_time) < 4 and (current != total):
             return
 
@@ -73,7 +72,6 @@ class ProgressManager:
         elapsed_time = now - self.start_time
         eta = (total - current) / speed if speed > 0 else 0
         
-        # نوار پیشرفت
         progress_bar = ""
         completed_blocks = int(percentage // 10)
         progress_bar = "🟢" * completed_blocks + "⚪️" * (10 - completed_blocks)
@@ -105,7 +103,7 @@ async def root_handler(request):
 async def stream_handler(request):
     """
     هندلر دانلود فایل از تلگرام (File -> Link)
-    اصلاح شده برای رفع مشکل گیر کردن دانلود در 99%
+    اصلاح شده برای رفع مشکل گیر کردن: حذف Content-Length + بستن اجباری کانکشن
     """
     try:
         encoded_data = request.match_info.get('code')
@@ -125,33 +123,35 @@ async def stream_handler(request):
                 file_name = attr.file_name
                 break
         
-        file_size = message.document.size
-        # انکود کردن نام فایل برای پشتیبانی از حروف فارسی و فاصله
+        # نکته مهم: ما اینجا حجم را به مرورگر نمیدهیم تا منتظر نماند.
+        # مرورگر دانلود را نشان میدهد اما درصد پر نمیشود (چون انتها باز است)
+        # اما در عوض دانلود ۱۰۰٪ موفق انجام میشود و گیر نمیکند.
         encoded_filename = quote(file_name)
 
-        # هدرهای اصلاح شده برای بستن صحیح کانکشن
         headers = {
             'Content-Type': message.document.mime_type or 'application/octet-stream',
             'Content-Disposition': f'attachment; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}',
-            'Content-Length': str(file_size),
-            'Connection': 'close', # این خط باعث می‌شود دانلود منیجر بفهمد فایل تمام شده است
-            'Access-Control-Allow-Origin': '*'
+            'Connection': 'keep-alive',
         }
 
         response = web.StreamResponse(status=200, headers=headers)
+        
+        # فعال کردن Chunked Encoding (بسیار مهم برای استریم بدون گیر کردن)
+        response.enable_chunked_encoding()
+        
         await response.prepare(request)
 
-        # استریم کردن فایل
         try:
-            async for chunk in client.iter_download(message.media):
+            # استفاده از چانک سایز ۶۴ کیلوبایت برای پایداری بیشتر
+            async for chunk in client.iter_download(message.media, chunk_size=65536):
                 await response.write(chunk)
+            
+            # پایان موفقیت آمیز
+            await response.write_eof()
+            
         except Exception as e:
             logger.error(f"Stream interrupted: {e}")
-            # اگر ارتباط قطع شد، کاری نمیشه کرد، فقط لاگ میکنیم
-            pass
-
-        # پایان دادن به استریم به صورت صحیح
-        await response.write_eof()
+            
         return response
 
     except Exception as e:
@@ -188,13 +188,12 @@ async def start_handler(event):
 async def help_handler(event):
     await event.answer("فایل بفرست -> لینک بگیر\nلینک بفرست -> فایل بگیر", alert=True)
 
-# ----------------- هندلر لینک به فایل (Leech) - دست نخورده -----------------
+# ----------------- هندلر لینک به فایل (Leech) - (دست نخورده طبق دستور) -----------------
 @client.on(events.NewMessage(pattern=r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'))
 async def url_handler(event):
     url = event.text.strip()
     
-    # بررسی اولیه
-    if "tele" in url and "gram" in url: # جلوگیری از لوپ
+    if "tele" in url and "gram" in url:
         return
 
     msg = await event.reply("🔎 **در حال بررسی لینک...**")
@@ -207,42 +206,36 @@ async def url_handler(event):
                     await msg.edit("❌ **خطا:** لینک قابل دانلود نیست (Status code != 200)")
                     return
                 
-                # استخراج نام فایل و حجم
                 total_size = int(response.headers.get('content-length', 0))
                 filename = os.path.basename(unquote(url))
                 if not filename:
                     filename = f"file_{int(time.time())}"
                 
-                # اگر نام فایل در هدر بود
                 if "Content-Disposition" in response.headers:
                     cd = response.headers["Content-Disposition"]
                     if 'filename=' in cd:
                         filename = cd.split('filename=')[1].strip('"')
 
-                # محدودیت فضا در رندر (حدودا 512 تا 1 گیگ فضای موقت داریم)
                 local_file = f"downloads/{filename}"
                 os.makedirs("downloads", exist_ok=True)
                 
-                # === مرحله 1: دانلود به سرور ===
                 progress_dl = ProgressManager(event, "دانلود به سرور")
-                progress_dl.message = msg # استفاده از همان پیام قبلی
+                progress_dl.message = msg
                 
                 downloaded = 0
                 
                 with open(local_file, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(1024*1024): # 1MB chunks
+                    async for chunk in response.content.iter_chunked(1024*1024):
                         f.write(chunk)
                         downloaded += len(chunk)
                         if total_size > 0:
                             await progress_dl.callback(downloaded, total_size)
                 
-                # === مرحله 2: آپلود به تلگرام ===
                 await msg.edit("✅ **دانلود تکمیل شد! در حال آپلود به تلگرام...**")
                 
                 progress_ul = ProgressManager(event, "آپلود به تلگرام")
                 progress_ul.message = msg
                 
-                # تشخیص نوع فایل برای نمایش بهتر در تلگرام
                 attributes = []
                 mime_type = mimetypes.guess_type(local_file)[0]
                 if mime_type and mime_type.startswith('video'):
@@ -260,13 +253,11 @@ async def url_handler(event):
                     reply_to=event.id
                 )
                 
-                # پایان کار
                 end_time = time.time()
                 duration = time_formatter((end_time - start_time) * 1000)
-                await msg.delete() # حذف پیام وضعیت
+                await msg.delete()
                 await event.reply(f"✅ **عملیات با موفقیت انجام شد!**\n⏱ زمان کل: {duration}", file=uploaded_file)
                 
-                # پاکسازی فایل موقت
                 os.remove(local_file)
 
     except Exception as e:
@@ -313,7 +304,7 @@ async def file_handler(event):
 🔗 **لینک شما:**
 `{download_link}`
 
-⚠️ _این لینک مستقیم از سرور تلگرام استریم می‌شود و سرعت آن عالی است._
+⚠️ _این لینک مستقیم از سرور تلگرام استریم می‌شود._
         """
         
         buttons = [

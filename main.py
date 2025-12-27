@@ -3,130 +3,163 @@ import sys
 import logging
 import asyncio
 import base64
-import re
+import time
+import math
 import mimetypes
-from urllib.parse import quote
+from urllib.parse import quote, unquote
+from datetime import datetime
 
 # کتابخانه‌های وب و تلگرام
 from aiohttp import web
+import aiohttp
 from telethon import TelegramClient, events, Button, utils
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
 # ================= تنظیمات (کانفیگ) =================
-# مقادیر شما جایگذاری شد
 API_ID = 27868969
 API_HASH = 'bdd2e8fccf95c9d7f3beeeff045f8df4'
 BOT_TOKEN = '8023182650:AAFOTfKFHSqQ9FHTNIKHKEOj5frzORQciBo'
 
-# تنظیمات لاگ برای دیدن خطاها در کنسول رندر
+# تنظیمات لاگ
 logging.basicConfig(
     format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# تشخیص آدرس سایت در سرور رندر
-# رندر به صورت خودکار این متغیر را ست می‌کند
-RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL')
-if not RENDER_EXTERNAL_URL:
-    # حالت لوکال برای تست
-    RENDER_EXTERNAL_URL = "http://localhost:8080" 
-    logger.warning("Running locally or RENDER_URL not found.")
+# آدرس سرور (خودکار)
+RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:8080')
 
-# ================= راه‌اندازی کلاینت تلگرام =================
-# استفاده از سشن در حافظه (چون رندر حافظه دائم ندارد)
-# اما چون ربات است، نیازی به لاگین مجدد با شماره نیست و توکن کافیست.
+# کلاینت تلگرام
 client = TelegramClient('bot_session', API_ID, API_HASH)
+
+# ================= توابع کمکی (Utility) =================
+
+def human_readable_size(size, decimal_places=2):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            return f"{size:.{decimal_places}f} {unit}"
+        size /= 1024.0
+    return f"{size:.{decimal_places}f} PB"
+
+def time_formatter(milliseconds: int) -> str:
+    seconds, milliseconds = divmod(int(milliseconds), 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    tmp = ((str(days) + "d, ") if days else "") + \
+        ((str(hours) + "h, ") if hours else "") + \
+        ((str(minutes) + "m, ") if minutes else "") + \
+        ((str(seconds) + "s") if seconds else "")
+    return tmp[:-2] if tmp.endswith(", ") else tmp
+
+class ProgressManager:
+    def __init__(self, event, action_name):
+        self.event = event
+        self.last_update_time = 0
+        self.action_name = action_name # "دانلود" یا "آپلود"
+        self.start_time = time.time()
+        self.message = None
+
+    async def callback(self, current, total):
+        now = time.time()
+        # آپدیت پیام هر 5 ثانیه یا در پایان کار (برای جلوگیری از بن شدن)
+        if (now - self.last_update_time) < 4 and (current != total):
+            return
+
+        self.last_update_time = now
+        percentage = current * 100 / total
+        speed = current / (now - self.start_time) if (now - self.start_time) > 0 else 0
+        elapsed_time = now - self.start_time
+        eta = (total - current) / speed if speed > 0 else 0
+        
+        # نوار پیشرفت
+        progress_bar = ""
+        completed_blocks = int(percentage // 10)
+        progress_bar = "🟢" * completed_blocks + "⚪️" * (10 - completed_blocks)
+
+        text = f"""
+🚀 **در حال {self.action_name}...**
+
+{progress_bar} **{percentage:.1f}%**
+
+📦 **حجم:** `{human_readable_size(current)}` / `{human_readable_size(total)}`
+⚡️ **سرعت:** `{human_readable_size(speed)}/s`
+⏱ **زمان:** `{time_formatter(elapsed_time*1000)}`
+⏳ **باقی‌مانده:** `{time_formatter(eta*1000)}`
+        """
+        
+        try:
+            if not self.message:
+                self.message = await self.event.respond(text)
+            else:
+                await self.message.edit(text)
+        except Exception as e:
+            logger.warning(f"Error updating progress: {e}")
 
 # ================= بخش وب‌سرور (دانلودر) =================
 
 async def root_handler(request):
-    """صفحه اصلی که نشان می‌دهد ربات زنده است"""
-    return web.Response(
-        text=f"🤖 Bot is running on: {RENDER_EXTERNAL_URL}\nPython Telethon Streamer",
-        content_type='text/plain'
-    )
+    return web.Response(text="Bot is running...", content_type='text/plain')
 
 async def stream_handler(request):
-    """هندلر اصلی برای دانلود فایل"""
     try:
         encoded_data = request.match_info.get('code')
-        
-        # دیکد کردن اطلاعات فایل از URL
-        # فرمت: chat_id:message_id
         try:
             decoded = base64.urlsafe_b64decode(encoded_data).decode()
             chat_id, message_id = map(int, decoded.split(':'))
         except:
-            return web.Response(text="❌ لینک نامعتبر یا خراب است.", status=400)
+            return web.Response(text="Link Invalid", status=400)
 
-        # دریافت پیام از تلگرام
         message = await client.get_messages(chat_id, ids=message_id)
-        
         if not message or not message.media:
-            return web.Response(text="❌ فایل یافت نشد یا حذف شده است.", status=404)
+            return web.Response(text="File Not Found", status=404)
 
-        # استخراج نام و سایز فایل
-        file_name = "downloaded_file"
-        file_size = 0
-        mime_type = "application/octet-stream"
-
-        # تلاش برای پیدا کردن نام فایل
+        file_name = "file"
         for attr in message.document.attributes:
             if isinstance(attr, DocumentAttributeFilename):
                 file_name = attr.file_name
                 break
         
         file_size = message.document.size
-        mime_type = message.document.mime_type
-        
-        # انکود کردن نام فایل برای مرورگرها
         encoded_filename = quote(file_name)
 
-        # ساخت هدرهای پاسخ
         headers = {
-            'Content-Type': mime_type,
+            'Content-Type': message.document.mime_type,
             'Content-Disposition': f'attachment; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}',
             'Content-Length': str(file_size)
         }
 
-        # ایجاد پاسخ استریم
-        response = web.StreamResponse(status=200, reason='OK', headers=headers)
+        response = web.StreamResponse(status=200, headers=headers)
         await response.prepare(request)
 
-        # دانلود و استریم همزمان (Chunk by Chunk)
-        # این جادو باعث می‌شود رم سرور پر نشود
         async for chunk in client.iter_download(message.media):
             await response.write(chunk)
 
         await response.write_eof()
         return response
 
-    except Exception as e:
-        logger.error(f"Download Error: {e}")
-        return web.Response(text="❌ خطایی در دانلود رخ داد. لطفا دوباره تلاش کنید.", status=500)
+    except Exception:
+        return web.Response(status=500)
 
 # ================= بخش ربات تلگرام =================
 
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
-    """پاسخ به دستور استارت"""
     user = await event.get_sender()
     name = user.first_name if user else "کاربر"
     
+    # لینک سرور حذف شد و فقط قابلیت‌ها ذکر شده
     text = f"""
-👋 **سلام {name} عزیز! به ربات دانلودر نامحدود خوش آمدی**
+👋 **سلام {name} عزیز!**
 
-🚀 **قدرت گرفته از Telethon و Python**
-من می‌تونم فایل‌های خیلی بزرگ (حتی تا ۲ گیگابایت) رو به لینک دانلود مستقیم تبدیل کنم.
+من یک ربات ابزار فایل پیشرفته هستم. 🛠
 
-📤 **کافیه فایلت رو بفرستی:**
-• ویدیو
-• آهنگ
-• داکیومنت
-• و...
+**قابلیت‌های من:**
+1️⃣ **تبدیل فایل به لینک:** فایل بفرست، لینک دانلود مستقیم بگیر.
+2️⃣ **آپلودر لینک:** لینک مستقیم بفرست، فایلش رو توی تلگرام تحویل بگیر.
 
-⚡️ **سرور:** {RENDER_EXTERNAL_URL}
+🚀 **بدون محدودیت حجم (تا ۲ گیگابایت)**
     """
     
     buttons = [
@@ -138,50 +171,125 @@ async def start_handler(event):
 
 @client.on(events.CallbackQuery(data=b"help"))
 async def help_handler(event):
-    await event.answer("فایلت رو بفرست، لینک تحویل بگیر! همین.", alert=True)
+    await event.answer("فایل بفرست -> لینک بگیر\nلینک بفرست -> فایل بگیر", alert=True)
 
-@client.on(events.NewMessage)
-async def file_handler(event):
-    """پردازش فایل‌های دریافتی"""
-    # اگر پیام متنی است یا مدیا ندارد، کاری نکن (مگر اینکه استارت باشد که بالا هندل شد)
-    if not event.media or event.message.message.startswith('/'):
+# ----------------- هندلر لینک به فایل (Leech) -----------------
+@client.on(events.NewMessage(pattern=r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'))
+async def url_handler(event):
+    url = event.text.strip()
+    
+    # بررسی اولیه
+    if "tele" in url and "gram" in url: # جلوگیری از لوپ
         return
 
-    # بررسی نوع مدیا (عکس، ویدیو، داکیومنت و...)
-    # ما همه چیز را قبول می‌کنیم
+    msg = await event.reply("🔎 **در حال بررسی لینک...**")
+    start_time = time.time()
     
-    msg = await event.reply("🔄 **در حال پردازش فایل و ساخت لینک...**")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    await msg.edit("❌ **خطا:** لینک قابل دانلود نیست (Status code != 200)")
+                    return
+                
+                # استخراج نام فایل و حجم
+                total_size = int(response.headers.get('content-length', 0))
+                filename = os.path.basename(unquote(url))
+                if not filename:
+                    filename = f"file_{int(time.time())}"
+                
+                # اگر نام فایل در هدر بود
+                if "Content-Disposition" in response.headers:
+                    cd = response.headers["Content-Disposition"]
+                    if 'filename=' in cd:
+                        filename = cd.split('filename=')[1].strip('"')
+
+                # محدودیت فضا در رندر (حدودا 512 تا 1 گیگ فضای موقت داریم)
+                # برای فایل‌های خیلی بزرگ، ریسک بسته شدن برنامه وجود دارد
+                
+                local_file = f"downloads/{filename}"
+                os.makedirs("downloads", exist_ok=True)
+                
+                # === مرحله 1: دانلود به سرور ===
+                progress_dl = ProgressManager(event, "دانلود به سرور")
+                progress_dl.message = msg # استفاده از همان پیام قبلی
+                
+                downloaded = 0
+                
+                with open(local_file, 'wb') as f:
+                    async for chunk in response.content.iter_chunked(1024*1024): # 1MB chunks
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            await progress_dl.callback(downloaded, total_size)
+                
+                # === مرحله 2: آپلود به تلگرام ===
+                await msg.edit("✅ **دانلود تکمیل شد! در حال آپلود به تلگرام...**")
+                
+                progress_ul = ProgressManager(event, "آپلود به تلگرام")
+                progress_ul.message = msg
+                
+                # تشخیص نوع فایل برای نمایش بهتر در تلگرام (ویدیو یا فایل)
+                attributes = []
+                mime_type = mimetypes.guess_type(local_file)[0]
+                if mime_type and mime_type.startswith('video'):
+                    attributes = [DocumentAttributeVideo(
+                        duration=0, w=0, h=0, supports_streaming=True
+                    )]
+                
+                uploaded_file = await client.send_file(
+                    event.chat_id,
+                    local_file,
+                    caption=f"📁 **{filename}**\n💾 Size: {human_readable_size(downloaded)}",
+                    progress_callback=progress_ul.callback,
+                    attributes=attributes,
+                    force_document=False,
+                    reply_to=event.id
+                )
+                
+                # پایان کار
+                end_time = time.time()
+                duration = time_formatter((end_time - start_time) * 1000)
+                await msg.delete() # حذف پیام وضعیت
+                await event.reply(f"✅ **عملیات با موفقیت انجام شد!**\n⏱ زمان کل: {duration}", file=uploaded_file)
+                
+                # پاکسازی فایل موقت
+                os.remove(local_file)
+
+    except Exception as e:
+        logger.error(f"Url Error: {e}")
+        await msg.edit(f"❌ **خطا:** {str(e)}")
+        # تلاش برای پاکسازی
+        if 'local_file' in locals() and os.path.exists(local_file):
+            os.remove(local_file)
+
+# ----------------- هندلر فایل به لینک -----------------
+@client.on(events.NewMessage)
+async def file_handler(event):
+    if not event.media or event.message.message.startswith('/') or event.message.message.startswith('http'):
+        return
+
+    msg = await event.reply("🔗 **در حال ساخت لینک دانلود...**")
     
     try:
         chat_id = event.chat_id
         message_id = event.id
-        
-        # ساخت شناسه یکتا برای لینک
-        # ترکیب چت آیدی و مسیج آیدی را کد می‌کنیم تا در URL تمیز باشد
         unique_id = f"{chat_id}:{message_id}"
         encoded_id = base64.urlsafe_b64encode(unique_id.encode()).decode()
         
-        # ساخت لینک نهایی
-        # اگر در انتهای URL رندر اسلش بود یا نبود هندل میکنیم
         base_url = RENDER_EXTERNAL_URL.rstrip('/')
         
-        # استخراج نام فایل برای نمایش زیباتر
-        file_name = "Unknown File"
-        file_size_str = "Unknown Size"
+        file_name = "Unknown"
+        file_size_str = "Unknown"
         
         if hasattr(event.media, 'document'):
-            file_size = event.media.document.size
-            file_size_str = utils.get_extension(event.media) or "File"
-            # تبدیل بایت به مگابایت
-            size_mb = file_size / (1024 * 1024)
+            size_mb = event.media.document.size / (1024 * 1024)
             file_size_str = f"{size_mb:.2f} MB"
-            
             for attr in event.media.document.attributes:
                 if isinstance(attr, DocumentAttributeFilename):
                     file_name = attr.file_name
                     break
         
-        # لینک دانلود
         download_link = f"{base_url}/dl/{encoded_id}"
         
         text = f"""
@@ -191,56 +299,43 @@ async def file_handler(event):
 💾 **حجم:** `{file_size_str}`
 
 🔗 **لینک شما:**
-{download_link}
+`{download_link}`
 
-⚠️ _این لینک تا زمانی که فایل را از اینجا پاک نکنید فعال است._
-🚀 _سرعت بالا | بدون فیلتر_
+⚠️ _اعتبار لینک تا زمان حذف فایل از تلگرام_
         """
         
         buttons = [
             [Button.url("📥 دانلود فوری", download_link)],
-            [Button.url("اشتراک گذاری لینک 🔗", f"https://t.me/share/url?url={download_link}")]
+            [Button.url("اشتراک گذاری 🔗", f"https://t.me/share/url?url={download_link}")]
         ]
         
         await msg.edit(text, buttons=buttons, link_preview=False)
         
     except Exception as e:
         logger.error(e)
-        await msg.edit(f"❌ خطا: {str(e)}")
+        await msg.edit("❌ خطایی رخ داد.")
 
 # ================= اجرای برنامه =================
-
 async def main():
-    # 1. استارت کلاینت تلگرام
     await client.start(bot_token=BOT_TOKEN)
-    logger.info("✅ Telegram Bot Started!")
+    logger.info("✅ Bot Started!")
 
-    # 2. تنظیم وب سرور
     app = web.Application()
     app.router.add_get('/', root_handler)
     app.router.add_get('/dl/{code}', stream_handler)
     
-    # دریافت پورت از رندر (پیش‌فرض 10000)
     port = int(os.environ.get("PORT", 8080))
-    
-    # راه‌اندازی وب سرور
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)
-    
-    logger.info(f"🌍 Web Server Starting on port {port}...")
     await site.start()
 
-    # نگه داشتن برنامه
-    # این دستور باعث می‌شود هم وب سرور و هم ربات با هم کار کنند
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    # استفاده از uvloop برای سرعت بیشتر (اگر نصب باشد)
     try:
         import uvloop
         uvloop.install()
     except ImportError:
         pass
-
     asyncio.run(main())

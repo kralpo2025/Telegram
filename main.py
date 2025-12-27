@@ -63,7 +63,7 @@ class ProgressManager:
 
     async def callback(self, current, total):
         now = time.time()
-        # آپدیت پیام هر 5 ثانیه یا در پایان کار (برای جلوگیری از بن شدن)
+        # آپدیت پیام هر 4 ثانیه یا در پایان کار (برای جلوگیری از بن شدن)
         if (now - self.last_update_time) < 4 and (current != total):
             return
 
@@ -103,6 +103,10 @@ async def root_handler(request):
     return web.Response(text="Bot is running...", content_type='text/plain')
 
 async def stream_handler(request):
+    """
+    هندلر دانلود فایل از تلگرام (File -> Link)
+    اصلاح شده برای رفع مشکل گیر کردن دانلود در 99%
+    """
     try:
         encoded_data = request.match_info.get('code')
         try:
@@ -122,25 +126,37 @@ async def stream_handler(request):
                 break
         
         file_size = message.document.size
+        # انکود کردن نام فایل برای پشتیبانی از حروف فارسی و فاصله
         encoded_filename = quote(file_name)
 
+        # هدرهای اصلاح شده برای بستن صحیح کانکشن
         headers = {
-            'Content-Type': message.document.mime_type,
+            'Content-Type': message.document.mime_type or 'application/octet-stream',
             'Content-Disposition': f'attachment; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}',
-            'Content-Length': str(file_size)
+            'Content-Length': str(file_size),
+            'Connection': 'close', # این خط باعث می‌شود دانلود منیجر بفهمد فایل تمام شده است
+            'Access-Control-Allow-Origin': '*'
         }
 
         response = web.StreamResponse(status=200, headers=headers)
         await response.prepare(request)
 
-        async for chunk in client.iter_download(message.media):
-            await response.write(chunk)
+        # استریم کردن فایل
+        try:
+            async for chunk in client.iter_download(message.media):
+                await response.write(chunk)
+        except Exception as e:
+            logger.error(f"Stream interrupted: {e}")
+            # اگر ارتباط قطع شد، کاری نمیشه کرد، فقط لاگ میکنیم
+            pass
 
+        # پایان دادن به استریم به صورت صحیح
         await response.write_eof()
         return response
 
-    except Exception:
-        return web.Response(status=500)
+    except Exception as e:
+        logger.error(f"Handler Error: {e}")
+        return web.Response(text="Internal Server Error", status=500)
 
 # ================= بخش ربات تلگرام =================
 
@@ -149,7 +165,6 @@ async def start_handler(event):
     user = await event.get_sender()
     name = user.first_name if user else "کاربر"
     
-    # لینک سرور حذف شد و فقط قابلیت‌ها ذکر شده
     text = f"""
 👋 **سلام {name} عزیز!**
 
@@ -173,7 +188,7 @@ async def start_handler(event):
 async def help_handler(event):
     await event.answer("فایل بفرست -> لینک بگیر\nلینک بفرست -> فایل بگیر", alert=True)
 
-# ----------------- هندلر لینک به فایل (Leech) -----------------
+# ----------------- هندلر لینک به فایل (Leech) - دست نخورده -----------------
 @client.on(events.NewMessage(pattern=r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'))
 async def url_handler(event):
     url = event.text.strip()
@@ -205,8 +220,6 @@ async def url_handler(event):
                         filename = cd.split('filename=')[1].strip('"')
 
                 # محدودیت فضا در رندر (حدودا 512 تا 1 گیگ فضای موقت داریم)
-                # برای فایل‌های خیلی بزرگ، ریسک بسته شدن برنامه وجود دارد
-                
                 local_file = f"downloads/{filename}"
                 os.makedirs("downloads", exist_ok=True)
                 
@@ -229,7 +242,7 @@ async def url_handler(event):
                 progress_ul = ProgressManager(event, "آپلود به تلگرام")
                 progress_ul.message = msg
                 
-                # تشخیص نوع فایل برای نمایش بهتر در تلگرام (ویدیو یا فایل)
+                # تشخیص نوع فایل برای نمایش بهتر در تلگرام
                 attributes = []
                 mime_type = mimetypes.guess_type(local_file)[0]
                 if mime_type and mime_type.startswith('video'):
@@ -259,11 +272,10 @@ async def url_handler(event):
     except Exception as e:
         logger.error(f"Url Error: {e}")
         await msg.edit(f"❌ **خطا:** {str(e)}")
-        # تلاش برای پاکسازی
         if 'local_file' in locals() and os.path.exists(local_file):
             os.remove(local_file)
 
-# ----------------- هندلر فایل به لینک -----------------
+# ----------------- هندلر فایل به لینک (Stream) -----------------
 @client.on(events.NewMessage)
 async def file_handler(event):
     if not event.media or event.message.message.startswith('/') or event.message.message.startswith('http'):
@@ -301,7 +313,7 @@ async def file_handler(event):
 🔗 **لینک شما:**
 `{download_link}`
 
-⚠️ _اعتبار لینک تا زمان حذف فایل از تلگرام_
+⚠️ _این لینک مستقیم از سرور تلگرام استریم می‌شود و سرعت آن عالی است._
         """
         
         buttons = [
